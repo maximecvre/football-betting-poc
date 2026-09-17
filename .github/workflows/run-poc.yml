@@ -1,0 +1,46 @@
+name: Run Football Value Betting PoC
+
+# "workflow_dispatch" ajoute un bouton "Run workflow" dÃ©clenchable
+# manuellement depuis l'onglet Actions â€” y compris depuis l'app mobile
+# GitHub ou un navigateur mobile. Les deux champs ci-dessous apparaissent
+# comme des paramÃ¨tres modifiables au moment du dÃ©clenchement.
+on:
+  workflow_dispatch:
+    inputs:
+      n_matches:
+        description: "Nombre de matchs simulÃ©s pour l'entraÃ®nement"
+        required: false
+        default: "6000"
+      bankroll:
+        description: "Bankroll de dÃ©part (â‚¬)"
+        required: false
+        default: "1000"
+
+jobs:
+  run-poc:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du dÃ©pÃ´t
+        uses: actions/checkout@v4
+
+      - name: Configuration de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installation des dÃ©pendances
+        run: pip install -r requirements.txt
+
+      - name: ExÃ©cution du script
+        env:
+          N_MATCHES: ${{ github.event.inputs.n_matches }}
+          BANKROLL: ${{ github.event.inputs.bankroll }}
+        run: python football_value_betting_poc.py
+
+      # Rend le CSV des value bets tÃ©lÃ©chargeable depuis le run (visible
+      # aussi depuis l'app mobile, dans la page du run terminÃ©).
+      - name: Sauvegarde du rÃ©sultat (CSV)
+        uses: actions/upload-artifact@v4
+        with:
+          name: value-bets-results
+          path: value_bets_output.csv
