@@ -16,9 +16,25 @@ on:
         required: false
         default: "1000"
 
+# Autorisations nÃ©cessaires pour que le job puisse publier sur GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Ã‰vite que deux dÃ©ploiements Pages se chevauchent si deux runs se suivent.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
   run-poc:
     runs-on: ubuntu-latest
+    # Ce bloc "environment" fait apparaÃ®tre l'URL de la page publiÃ©e
+    # directement dans le rÃ©sumÃ© du run (et dans l'app mobile GitHub).
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Checkout du dÃ©pÃ´t
         uses: actions/checkout@v4
@@ -44,3 +60,21 @@ jobs:
         with:
           name: value-bets-results
           path: value_bets_output.csv
+
+      # --- Publication du rapport HTML sur GitHub Pages ---
+      - name: PrÃ©paration du dossier Ã  publier
+        run: |
+          mkdir -p public
+          cp report.html public/index.html
+
+      - name: Configuration de GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload du rapport comme artifact Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: DÃ©ploiement sur GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
