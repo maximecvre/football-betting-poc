@@ -51,6 +51,14 @@ jobs:
         env:
           N_MATCHES: ${{ github.event.inputs.n_matches }}
           BANKROLL: ${{ github.event.inputs.bankroll }}
+          # Ces 3 secrets sont optionnels : absents, le script reste en
+          # mode simulÃ© (comportement inchangÃ©). PrÃ©sents, il bascule
+          # automatiquement sur les vraies donnÃ©es correspondantes.
+          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          OPENWEATHER_KEY: ${{ secrets.OPENWEATHER_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          LEAGUE_ID: "61"          # 61 = Ligue 1 sur API-Football
+          ODDS_SPORT_KEY: "soccer_france_ligue_one"
         run: python football_value_betting_poc.py
 
       # Rend le CSV des value bets tÃ©lÃ©chargeable depuis le run (visible
