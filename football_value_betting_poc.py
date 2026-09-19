@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -68,6 +69,13 @@ WEATHER_GOAL_IMPACT: dict[str, float] = {
 }
 
 RESULT_LABELS = ["AWAY_WIN", "DRAW", "HOME_WIN"]
+
+# Libellés lisibles pour l'affichage (rapport HTML, logs)
+RESULT_LABELS_FR: dict[str, str] = {
+    "HOME_WIN": "Victoire Domicile",
+    "DRAW": "Match Nul",
+    "AWAY_WIN": "Victoire Extérieure",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -452,29 +460,34 @@ def train_model(
 # 4. SIMULATION DES COTES BOOKMAKER
 # ---------------------------------------------------------------------------
 def simulate_bookmaker_odds(
-    true_proba: pd.DataFrame, bookmaker_margin: float = 0.06, noise_scale: float = 0.04, seed: int = 11
+    true_proba: pd.DataFrame, bookmaker_margin: float = 0.06, noise_scale: float = 0.18, seed: int = 11
 ) -> pd.DataFrame:
     """Simule des cotes de bookmaker (format décimal) à partir de probabilités.
 
     En production, cette fonction serait remplacée par un appel à une API
     de cotes (Odds API, Betfair Exchange, etc.). La simulation applique une
-    marge bookmaker (overround) et un bruit pour représenter l'écart entre
-    l'évaluation du bookmaker et celle de notre modèle -- c'est cet écart
-    que le détecteur de value bets cherche à exploiter.
+    marge bookmaker (overround) et un bruit *multiplicatif* (log-normal)
+    pour représenter l'écart entre l'évaluation du bookmaker et celle de
+    notre modèle -- c'est cet écart que le détecteur de value bets cherche
+    à exploiter. Un bruit multiplicatif (plutôt qu'additif) évite de
+    déformer excessivement les faibles probabilités (ex: 5%), ce qui
+    produirait des cotes et des EV irréalistes.
 
     Args:
         true_proba: probabilités "de référence" (ex: celles du modèle IA,
             utilisées ici uniquement pour générer des cotes réalistes).
         bookmaker_margin: marge globale du bookmaker (overround), typ. 5-8%.
-        noise_scale: bruit appliqué pour simuler les divergences bookmaker/IA.
+        noise_scale: écart-type (échelle log) du bruit multiplicatif appliqué
+            pour simuler les divergences bookmaker/IA.
         seed: graine aléatoire.
 
     Returns:
         DataFrame de cotes décimales, mêmes colonnes que `true_proba`.
     """
     rng = np.random.default_rng(seed)
-    noisy_proba = true_proba.to_numpy() + rng.normal(0, noise_scale, true_proba.shape)
-    noisy_proba = np.clip(noisy_proba, 0.02, 0.98)
+    noise_factor = np.exp(rng.normal(0, noise_scale, true_proba.shape))
+    noisy_proba = true_proba.to_numpy() * noise_factor
+    noisy_proba = np.clip(noisy_proba, 1e-3, None)
     noisy_proba = noisy_proba / noisy_proba.sum(axis=1, keepdims=True)
 
     # Overround : la somme des probabilités implicites des cotes dépasse 1.
@@ -590,7 +603,278 @@ def detect_value_bets(
 
 
 # ---------------------------------------------------------------------------
-# 6. MOTEUR D'EXÉCUTION PRINCIPAL
+# 6. RAPPORT HTML (résultats interprétés en langage clair)
+# ---------------------------------------------------------------------------
+def _signal_strength_label(expected_value: float) -> tuple[str, str]:
+    """Traduit une espérance mathématique (EV) en étiquette qualitative.
+
+    Retourne (libellé, classe_css). Ces seuils sont indicatifs, pas des
+    garanties statistiques -- ils servent uniquement à hiérarchiser
+    visuellement les opportunités détectées dans le rapport.
+    """
+    if expected_value >= 0.15:
+        return "Signal fort", "tag-strong"
+    if expected_value >= 0.05:
+        return "Signal modéré", "tag-medium"
+    return "Signal faible", "tag-weak"
+
+
+def generate_html_report(
+    trained_model: TrainedModel,
+    value_bets: list[ValueBet],
+    n_train_matches: int,
+    n_upcoming_matches: int,
+    bankroll: float,
+) -> str:
+    """Construit un rapport HTML autonome (CSS inclus, sans dépendance externe).
+
+    Le rapport traduit les résultats bruts (probabilités, cotes, EV, Kelly)
+    en informations directement lisibles : performance du modèle, liste des
+    opportunités détectées avec une explication en langage clair de
+    l'écart entre l'estimation de l'IA et celle du bookmaker, et un rappel
+    du caractère expérimental du PoC.
+
+    Args:
+        trained_model: modèle entraîné (pour les métriques d'évaluation).
+        value_bets: opportunités détectées par `detect_value_bets`.
+        n_train_matches: nombre de matchs utilisés pour l'entraînement.
+        n_upcoming_matches: nombre de matchs évalués pour la détection.
+        bankroll: bankroll de référence utilisée pour le dimensionnement.
+
+    Returns:
+        Le document HTML complet, prêt à être écrit sur disque.
+    """
+    generated_at = datetime.now(timezone.utc).strftime("%d/%m/%Y à %H:%M UTC")
+    algo_name = "XGBoost" if XGBOOST_AVAILABLE else "Random Forest"
+
+    # --- Construction des lignes (cartes) pour chaque value bet ---
+    rows_html = []
+    for vb in value_bets:
+        implied_proba = 1 / vb.bookmaker_odds
+        edge_points = (vb.ai_probability - implied_proba) * 100
+        strength_label, strength_class = _signal_strength_label(vb.expected_value)
+        outcome_fr = RESULT_LABELS_FR.get(vb.outcome, vb.outcome)
+
+        rows_html.append(
+            f"""
+            <div class="bet-card">
+                <div class="bet-card-header">
+                    <span class="match-id">Match #{vb.match_id}</span>
+                    <span class="tag {strength_class}">{strength_label}</span>
+                </div>
+                <div class="bet-outcome">{outcome_fr}</div>
+                <div class="bet-grid">
+                    <div class="metric">
+                        <span class="metric-label">Probabilité IA</span>
+                        <span class="metric-value">{vb.ai_probability:.1%}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Probabilité bookmaker</span>
+                        <span class="metric-value">{implied_proba:.1%}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Cote proposée</span>
+                        <span class="metric-value">{vb.bookmaker_odds:.2f}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Écart estimé</span>
+                        <span class="metric-value positive">+{edge_points:.1f} pts</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Espérance (EV)</span>
+                        <span class="metric-value positive">+{vb.expected_value:.1%}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Mise conseillée</span>
+                        <span class="metric-value stake">{vb.recommended_stake:.2f} €
+                            <small>({vb.kelly_stake_fraction:.1%} bankroll)</small>
+                        </span>
+                    </div>
+                </div>
+                <p class="bet-explainer">
+                    L'IA estime cette issue à <strong>{vb.ai_probability:.1%}</strong> alors que
+                    la cote du bookmaker (<strong>{vb.bookmaker_odds:.2f}</strong>) n'implique
+                    qu'une probabilité de <strong>{implied_proba:.1%}</strong> — un écart de
+                    <strong>{edge_points:.1f} points</strong> en faveur du pari, selon le modèle.
+                </p>
+            </div>"""
+        )
+
+    bets_section = (
+        "\n".join(rows_html)
+        if value_bets
+        else '<p class="no-bets">Aucune opportunité à valeur positive détectée sur ce lot de matchs.</p>'
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rapport PoC — Value Betting IA</title>
+<style>
+  :root {{
+    --bg: #f7f7f9;
+    --card-bg: #ffffff;
+    --text: #1a1a2e;
+    --text-muted: #666a80;
+    --accent: #2d5bff;
+    --positive: #1a8f5e;
+    --border: #e4e4ec;
+    --strong: #1a8f5e;
+    --medium: #b8860b;
+    --weak: #8a8f98;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #14151f;
+      --card-bg: #1e2030;
+      --text: #eaeaf2;
+      --text-muted: #9a9db3;
+      --accent: #6d8bff;
+      --positive: #4ade80;
+      --border: #2e3145;
+      --strong: #4ade80;
+      --medium: #eab308;
+      --weak: #7c8095;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    padding: 0 16px 48px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }}
+  .container {{ max-width: 760px; margin: 0 auto; }}
+  header {{ padding: 28px 0 16px; }}
+  h1 {{ font-size: 1.5rem; margin: 0 0 4px; }}
+  .subtitle {{ color: var(--text-muted); font-size: 0.9rem; margin: 0; }}
+  .kpi-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin: 20px 0;
+  }}
+  @media (min-width: 520px) {{ .kpi-grid {{ grid-template-columns: repeat(4, 1fr); }} }}
+  .kpi {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    text-align: center;
+  }}
+  .kpi-value {{ font-size: 1.3rem; font-weight: 700; display: block; }}
+  .kpi-label {{ font-size: 0.75rem; color: var(--text-muted); }}
+  h2 {{ font-size: 1.1rem; margin: 28px 0 12px; }}
+  .bet-card {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 14px;
+  }}
+  .bet-card-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }}
+  .match-id {{ font-size: 0.8rem; color: var(--text-muted); }}
+  .tag {{
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    color: #fff;
+  }}
+  .tag-strong {{ background: var(--strong); }}
+  .tag-medium {{ background: var(--medium); }}
+  .tag-weak {{ background: var(--weak); }}
+  .bet-outcome {{ font-size: 1.15rem; font-weight: 700; margin-bottom: 12px; }}
+  .bet-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px 16px;
+    margin-bottom: 10px;
+  }}
+  .metric {{ display: flex; flex-direction: column; }}
+  .metric-label {{ font-size: 0.72rem; color: var(--text-muted); }}
+  .metric-value {{ font-size: 1rem; font-weight: 600; }}
+  .metric-value.positive {{ color: var(--positive); }}
+  .metric-value.stake small {{ font-weight: 400; color: var(--text-muted); }}
+  .bet-explainer {{
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    border-top: 1px solid var(--border);
+    padding-top: 10px;
+    margin: 0;
+  }}
+  .no-bets {{ color: var(--text-muted); font-style: italic; }}
+  .disclaimer {{
+    margin-top: 32px;
+    padding: 14px 16px;
+    border-radius: 12px;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }}
+  footer {{ text-align: center; color: var(--text-muted); font-size: 0.75rem; margin-top: 24px; }}
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>⚽ Rapport Value Betting IA</h1>
+    <p class="subtitle">Généré le {generated_at} · Modèle : {algo_name} · PoC expérimental</p>
+  </header>
+
+  <div class="kpi-grid">
+    <div class="kpi">
+      <span class="kpi-value">{trained_model.test_accuracy:.1%}</span>
+      <span class="kpi-label">Précision (test)</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-value">{trained_model.test_log_loss:.3f}</span>
+      <span class="kpi-label">Log loss (test)</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-value">{n_train_matches:,}</span>
+      <span class="kpi-label">Matchs d'entraînement</span>
+    </div>
+    <div class="kpi">
+      <span class="kpi-value">{len(value_bets)}</span>
+      <span class="kpi-label">Opportunités / {n_upcoming_matches * 3} issues</span>
+    </div>
+  </div>
+
+  <h2>Opportunités détectées (triées par espérance)</h2>
+  {bets_section}
+
+  <div class="disclaimer">
+    <strong>À propos de ce rapport :</strong> les données sont simulées
+    (PoC de démonstration technique, pas de connexion à une API de cotes
+    réelle). Les probabilités et cotes affichées n'ont donc pas de valeur
+    prédictive réelle sur de vrais matchs. Aucun modèle ne garantit un
+    gain ; la mise "Kelly" affichée applique déjà une fraction réduite
+    (half-Kelly) et un plafond de sécurité pour limiter le risque, mais
+    reste un exercice mathématique, pas un conseil financier.
+    Bankroll de référence utilisée pour ce calcul : {bankroll:,.0f} €.
+  </div>
+
+  <footer>Rapport généré automatiquement — football_value_betting_poc.py</footer>
+</div>
+</body>
+</html>
+"""
+    return html
+
+
+# ---------------------------------------------------------------------------
+# 7. MOTEUR D'EXÉCUTION PRINCIPAL
 # ---------------------------------------------------------------------------
 def main(
     n_matches: int = 6000,
@@ -663,6 +947,18 @@ def main(
         )
     vb_df.to_csv("value_bets_output.csv", index=False)
     logger.info("Résultats exportés dans value_bets_output.csv")
+
+    # 6. Génération du rapport HTML interprété (à publier via GitHub Pages)
+    html_report = generate_html_report(
+        trained_model=trained_model,
+        value_bets=value_bets,
+        n_train_matches=n_matches,
+        n_upcoming_matches=len(upcoming_raw),
+        bankroll=bankroll,
+    )
+    with open("report.html", "w", encoding="utf-8") as f:
+        f.write(html_report)
+    logger.info("Rapport HTML généré : report.html")
 
 
 if __name__ == "__main__":
