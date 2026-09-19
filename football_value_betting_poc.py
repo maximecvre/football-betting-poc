@@ -1295,6 +1295,7 @@ def main(
     n_matches: int = 6000,
     bankroll: float = 1000.0,
     top_n_display: int = 10,
+    next_n_fixtures: int = 5,
 ) -> None:
     """Exécute le pipeline complet de bout en bout, à titre de démonstration."""
 
@@ -1317,7 +1318,7 @@ def main(
     if os.environ.get("API_FOOTBALL_KEY"):
         league_id = int(os.environ.get("LEAGUE_ID", "61"))  # 61 = Ligue 1
         season = int(os.environ.get("SEASON", str(datetime.now().year)))
-        upcoming_raw = fetch_upcoming_fixtures(league_id=league_id, season=season, next_n=10)
+        upcoming_raw = fetch_upcoming_fixtures(league_id=league_id, season=season, next_n=next_n_fixtures)
     else:
         logger.info("API_FOOTBALL_KEY absente -> matchs à venir simulés (comportement PoC).")
         upcoming_raw = simulate_raw_match_data(n_matches=200, seed=999)
@@ -1405,5 +1406,11 @@ if __name__ == "__main__":
 
     n_matches_arg = int(os.environ.get("N_MATCHES", 6000))
     bankroll_arg = float(os.environ.get("BANKROLL", 1000.0))
+    # Nombre de matchs à venir récupérés via API-Football. Chaque match
+    # coûte ~4 requêtes (repos + blessures pour les 2 équipes), + 1 requête
+    # fixe pour la liste des matchs -> budget = 1 + 4 * next_n_fixtures.
+    # Défaut à 5 : ~21 requêtes/run, largement sous le quota gratuit de
+    # 100/jour même en relançant le workflow plusieurs fois dans la journée.
+    next_n_arg = int(os.environ.get("NEXT_N", 5))
 
-    main(n_matches=n_matches_arg, bankroll=bankroll_arg)
+    main(n_matches=n_matches_arg, bankroll=bankroll_arg, next_n_fixtures=next_n_arg)
