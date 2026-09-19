@@ -15,6 +15,10 @@ on:
         description: "Bankroll de dÃ©part (â‚¬)"
         required: false
         default: "1000"
+      next_n:
+        description: "Nombre de prochains matchs Ligue 1 Ã  analyser (budget API-Football : 1 + 4Ã—ce nombre requÃªtes)"
+        required: false
+        default: "5"
 
 # Autorisations nÃ©cessaires pour que le job puisse publier sur GitHub Pages.
 permissions:
@@ -51,6 +55,7 @@ jobs:
         env:
           N_MATCHES: ${{ github.event.inputs.n_matches }}
           BANKROLL: ${{ github.event.inputs.bankroll }}
+          NEXT_N: ${{ github.event.inputs.next_n }}
           # Ces 3 secrets sont optionnels : absents, le script reste en
           # mode simulÃ© (comportement inchangÃ©). PrÃ©sents, il bascule
           # automatiquement sur les vraies donnÃ©es correspondantes.
