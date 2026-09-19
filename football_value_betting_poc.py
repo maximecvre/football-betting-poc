@@ -34,13 +34,17 @@ financier ou de pari.
 
 from __future__ import annotations
 
+import difflib
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import requests
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import train_test_split
@@ -222,6 +226,403 @@ def _simulate_match_result(
 
 
 # ---------------------------------------------------------------------------
+# 1bis. CONNEXION AUX VRAIES DONNÉES (matchs à venir)
+# ---------------------------------------------------------------------------
+# Ce bloc remplace `simulate_raw_match_data()` pour l'INFÉRENCE (matchs pas
+# encore joués, donc sans variable cible `result`). Il ne concerne PAS
+# l'entraînement : le modèle continue d'apprendre sur des données simulées
+# tant qu'un jeu de données historiques réel n'est pas branché (voir la
+# remarque dans `main()` plus bas).
+#
+# Sources utilisées, chacune optionnelle : si une clé d'API n'est pas
+# fournie (variable d'environnement absente), la colonne correspondante
+# est simplement omise -- et `build_features()` la simulera automatiquement
+# grâce à son mécanisme de fallback déjà en place. Autrement dit : plus tu
+# branches de vraies sources, moins `build_features()` simule de choses,
+# sans jamais rien casser.
+#
+#   - Calendrier des matchs, repos, blessures : API-Football (api-sports.io)
+#     -> clé attendue dans API_FOOTBALL_KEY (gratuit : 100 requêtes/jour)
+#   - Météo au moment du coup d'envoi : OpenWeather (prévision 5 jours/3h)
+#     -> clé attendue dans OPENWEATHER_KEY (gratuit)
+#   - Cotes de bookmaker réelles : The Odds API
+#     -> clé attendue dans ODDS_API_KEY (gratuit : 500 requêtes/mois)
+#   - Non couverts ici (pas de source gratuite fiable) : xG et historique
+#     détaillé de l'arbitre -> restent simulés par `build_features()`.
+
+API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
+OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/forecast"
+ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4/sports"
+
+# Table simplifiée impact-météo -> condition catégorielle utilisée par
+# `build_features()` (doit rester alignée avec WEATHER_GOAL_IMPACT).
+_OPENWEATHER_TO_CONDITION: dict[str, str] = {
+    "Clear": "sunny",
+    "Clouds": "cloudy",
+    "Rain": "rain",
+    "Drizzle": "rain",
+    "Thunderstorm": "rain",
+    "Snow": "snow",
+    "Mist": "windy",
+    "Fog": "windy",
+}
+
+
+def fetch_upcoming_fixtures(
+    league_id: int,
+    season: int,
+    next_n: int = 10,
+    timeout: int = 15,
+) -> pd.DataFrame:
+    """Récupère les prochains matchs réels via l'API API-Football.
+
+    Retourne un DataFrame avec le même schéma que `simulate_raw_match_data`
+    (moins la colonne `result`, inconnue pour un match pas encore joué).
+    Les colonnes non résolues (ex: xG, historique arbitre) sont absentes du
+    DataFrame -- `build_features()` s'en charge automatiquement en fallback.
+
+    Nécessite la variable d'environnement API_FOOTBALL_KEY.
+
+    Args:
+        league_id: identifiant de la compétition (ex: 61 = Ligue 1).
+            Trouvable via l'endpoint /leagues de l'API.
+        season: année de la saison (ex: 2026).
+        next_n: nombre de matchs à venir à récupérer.
+        timeout: délai max (secondes) par requête HTTP.
+
+    Returns:
+        DataFrame brut, une ligne par match à venir.
+    """
+    api_key = os.environ.get("API_FOOTBALL_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "API_FOOTBALL_KEY manquante : impossible de récupérer de vrais "
+            "matchs à venir. Ajoute cette variable d'environnement (ou "
+            "secret GitHub) pour utiliser cette fonction."
+        )
+    headers = {"x-apisports-key": api_key}
+
+    resp = requests.get(
+        f"{API_FOOTBALL_BASE_URL}/fixtures",
+        headers=headers,
+        params={"league": league_id, "season": season, "next": next_n},
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    fixtures = resp.json().get("response", [])
+
+    rows: list[dict] = []
+    for fx in fixtures:
+        fixture_id = fx["fixture"]["id"]
+        kickoff_iso = fx["fixture"]["date"]  # ex: "2026-09-27T15:00:00+00:00"
+        home_id = fx["teams"]["home"]["id"]
+        away_id = fx["teams"]["away"]["id"]
+        venue = fx["fixture"].get("venue") or {}
+
+        row: dict = {
+            "match_id": fixture_id,
+            "home_team": fx["teams"]["home"]["name"],
+            "away_team": fx["teams"]["away"]["name"],
+            "kickoff": kickoff_iso,
+        }
+
+        # Repos : nombre de jours depuis le dernier match de chaque équipe.
+        rest_days_home = _fetch_rest_days(home_id, kickoff_iso, headers, timeout)
+        rest_days_away = _fetch_rest_days(away_id, kickoff_iso, headers, timeout)
+        if rest_days_home is not None:
+            row["rest_days_home"] = rest_days_home
+        if rest_days_away is not None:
+            row["rest_days_away"] = rest_days_away
+
+        # Blessures : score d'impact = proportion de joueurs indisponibles
+        # parmi les absences reportées pour ce match (approximation simple ;
+        # une vraie pondération par importance du joueur serait plus fine).
+        injury_home = _fetch_injury_impact(home_id, fixture_id, headers, timeout)
+        injury_away = _fetch_injury_impact(away_id, fixture_id, headers, timeout)
+        if injury_home is not None:
+            row["key_injury_impact_home"] = injury_home
+        if injury_away is not None:
+            row["key_injury_impact_away"] = injury_away
+
+        # Météo : uniquement disponible si le match est dans les ~5 jours
+        # (limite de la prévision gratuite OpenWeather).
+        if venue.get("city"):
+            weather = _fetch_weather_condition(venue["city"], kickoff_iso, timeout)
+            if weather is not None:
+                row["weather_condition"] = weather
+
+        rows.append(row)
+
+    logger.info("%d matchs à venir récupérés depuis API-Football.", len(rows))
+    return pd.DataFrame(rows)
+
+
+def _fetch_rest_days(
+    team_id: int, before_iso: str, headers: dict, timeout: int
+) -> Optional[int]:
+    """Nombre de jours de repos d'une équipe avant `before_iso`.
+
+    Interroge le dernier match joué par l'équipe avant la date donnée.
+    Retourne None si l'information n'a pas pu être récupérée (l'appelant
+    laisse alors `build_features()` simuler cette valeur).
+    """
+    try:
+        before_date = datetime.fromisoformat(before_iso).date()
+        resp = requests.get(
+            f"{API_FOOTBALL_BASE_URL}/fixtures",
+            headers=headers,
+            params={"team": team_id, "last": 1, "to": before_date.isoformat()},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json().get("response", [])
+        if not data:
+            return None
+        last_match_date = datetime.fromisoformat(data[0]["fixture"]["date"]).date()
+        return max((before_date - last_match_date).days, 0)
+    except (requests.RequestException, KeyError, ValueError, IndexError) as exc:
+        logger.warning("Impossible de récupérer le repos pour l'équipe %s : %s", team_id, exc)
+        return None
+
+
+def _fetch_injury_impact(
+    team_id: int, fixture_id: int, headers: dict, timeout: int
+) -> Optional[float]:
+    """Score d'impact des blessures (0-1) pour une équipe sur un match donné.
+
+    Approximation simple : proportion (plafonnée) de joueurs listés comme
+    indisponibles pour ce match. À affiner en pondérant par le temps de jeu
+    habituel des joueurs concernés si l'abonnement API le permet.
+    """
+    try:
+        resp = requests.get(
+            f"{API_FOOTBALL_BASE_URL}/injuries",
+            headers=headers,
+            params={"team": team_id, "fixture": fixture_id},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        injured_players = resp.json().get("response", [])
+        # 6 absents ou plus -> impact maximal (1.0), plafonné pour rester
+        # dans une échelle comparable à la version simulée (loi bêta(2,8)).
+        return round(min(len(injured_players) / 6, 1.0), 3)
+    except (requests.RequestException, KeyError, ValueError) as exc:
+        logger.warning("Impossible de récupérer les blessures pour l'équipe %s : %s", team_id, exc)
+        return None
+
+
+def _fetch_weather_condition(city: str, kickoff_iso: str, timeout: int) -> Optional[str]:
+    """Condition météo catégorielle au coup d'envoi, via OpenWeather.
+
+    Utilise la prévision "5 jours / 3h" (gratuite) : ne fonctionne donc que
+    pour un match ayant lieu dans les ~5 prochains jours. Retourne None
+    au-delà (ou en cas d'erreur), laissant `build_features()` simuler.
+    """
+    api_key = os.environ.get("OPENWEATHER_KEY")
+    if not api_key:
+        return None
+    try:
+        kickoff_dt = datetime.fromisoformat(kickoff_iso)
+        resp = requests.get(
+            OPENWEATHER_BASE_URL,
+            params={"q": city, "appid": api_key, "units": "metric"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        forecast_slots = resp.json().get("list", [])
+        if not forecast_slots:
+            return None
+        # Sélectionne le créneau de prévision le plus proche du coup d'envoi.
+        closest = min(
+            forecast_slots,
+            key=lambda slot: abs(
+                datetime.fromtimestamp(slot["dt"], tz=timezone.utc) - kickoff_dt.astimezone(timezone.utc)
+            ),
+        )
+        main_condition = closest["weather"][0]["main"]
+        return _OPENWEATHER_TO_CONDITION.get(main_condition, "cloudy")
+    except (requests.RequestException, KeyError, ValueError, IndexError) as exc:
+        logger.warning("Impossible de récupérer la météo pour %s : %s", city, exc)
+        return None
+
+
+def fetch_real_bookmaker_odds(
+    sport_key: str = "soccer_epl", regions: str = "eu", timeout: int = 15
+) -> pd.DataFrame:
+    """Récupère de vraies cotes de bookmaker via The Odds API.
+
+    Remplace `simulate_bookmaker_odds()` pour un usage en conditions
+    réelles. Nécessite la variable d'environnement ODDS_API_KEY.
+
+    Args:
+        sport_key: identifiant de compétition côté The Odds API
+            (ex: "soccer_epl", "soccer_france_ligue_one").
+        regions: régions de bookmakers à interroger (impacte les cotes
+            disponibles ; "eu" couvre la plupart des bookmakers européens).
+        timeout: délai max (secondes) par requête HTTP.
+
+    Returns:
+        DataFrame indexé par un identifiant d'événement (`event_id`), avec
+        les colonnes AWAY_WIN / DRAW / HOME_WIN (cotes décimales moyennées
+        sur les bookmakers disponibles).
+    """
+    api_key = os.environ.get("ODDS_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "ODDS_API_KEY manquante : impossible de récupérer de vraies "
+            "cotes. Ajoute cette variable d'environnement (ou secret "
+            "GitHub) pour utiliser cette fonction."
+        )
+
+    resp = requests.get(
+        f"{ODDS_API_BASE_URL}/{sport_key}/odds",
+        params={
+            "apiKey": api_key,
+            "regions": regions,
+            "markets": "h2h",
+            "oddsFormat": "decimal",
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    events = resp.json()
+
+    rows = []
+    for event in events:
+        home_team, away_team = event["home_team"], event["away_team"]
+        odds_samples: dict[str, list[float]] = {"HOME_WIN": [], "DRAW": [], "AWAY_WIN": []}
+
+        for bookmaker in event.get("bookmakers", []):
+            for market in bookmaker.get("markets", []):
+                if market["key"] != "h2h":
+                    continue
+                for outcome in market["outcomes"]:
+                    if outcome["name"] == home_team:
+                        odds_samples["HOME_WIN"].append(outcome["price"])
+                    elif outcome["name"] == away_team:
+                        odds_samples["AWAY_WIN"].append(outcome["price"])
+                    else:
+                        odds_samples["DRAW"].append(outcome["price"])
+
+        if all(odds_samples.values()):  # au moins une cote par issue
+            rows.append(
+                {
+                    "event_id": event["id"],
+                    "home_team": home_team,
+                    "away_team": away_team,
+                    "HOME_WIN": np.mean(odds_samples["HOME_WIN"]),
+                    "DRAW": np.mean(odds_samples["DRAW"]),
+                    "AWAY_WIN": np.mean(odds_samples["AWAY_WIN"]),
+                }
+            )
+
+    odds_df = pd.DataFrame(rows)
+    logger.info("Cotes réelles récupérées pour %d matchs (The Odds API).", len(odds_df))
+    return odds_df
+
+
+# Rapprochements manuels pour les cas où la similarité automatique ne
+# suffit pas (sigles, noms très différents d'un fournisseur à l'autre —
+# ex: "PSG" chez un fournisseur, "Paris Saint Germain" chez un autre).
+# Clé et valeur normalisées (minuscules, sans espaces/accents/ponctuation) ;
+# complète cette table au fil des avertissements "Aucune cote correspondante"
+# vus dans les logs pour les clubs de tes ligues suivies.
+TEAM_NAME_ALIASES: dict[str, str] = {
+    # "psg": "parissaintgermain",
+}
+
+
+def _normalize_team_name(name: str) -> str:
+    """Normalise un nom d'équipe (+ alias manuel) pour faciliter le rapprochement."""
+    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+    return TEAM_NAME_ALIASES.get(normalized, normalized)
+
+
+def _team_name_similarity(name_a: str, name_b: str) -> float:
+    """Score de similarité (0-1) entre deux noms d'équipe.
+
+    Combine deux signaux car les fournisseurs nomment rarement les équipes
+    à l'identique : une comparaison caractère-à-caractère (`difflib`) pour
+    les variantes d'orthographe proches, et une comparaison par mot pour
+    les noms courts inclus dans un nom complet (ex: "Lyon" contenu dans
+    "Olympique Lyonnais"). Reste une heuristique : pour les cas ambigus
+    (sigles type "PSG"), complète `TEAM_NAME_ALIASES` ci-dessus.
+    """
+    norm_a, norm_b = _normalize_team_name(name_a), _normalize_team_name(name_b)
+    if norm_a == norm_b:
+        return 1.0
+
+    tokens_a = set(re.sub(r"[^a-z0-9\s]", "", name_a.lower()).split())
+    tokens_b = set(re.sub(r"[^a-z0-9\s]", "", name_b.lower()).split())
+    token_score = 0.0
+    if tokens_a and tokens_b:
+        matched = sum(
+            1
+            for ta in tokens_a
+            if any(len(ta) >= 3 and (ta in tb or tb in ta) for tb in tokens_b)
+        )
+        token_score = matched / min(len(tokens_a), len(tokens_b))
+
+    char_score = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+    return max(token_score, char_score)
+
+
+def match_fixtures_with_odds(
+    fixtures_df: pd.DataFrame, odds_df: pd.DataFrame, min_similarity: float = 0.5
+) -> pd.DataFrame:
+    """Associe les cotes réelles (The Odds API) aux matchs d'API-Football.
+
+    Les deux fournisseurs utilisent des identifiants différents pour un même
+    match : le rapprochement se fait donc par similarité des noms d'équipes
+    (les orthographes peuvent légèrement varier d'un fournisseur à l'autre,
+    ex. "Paris Saint Germain" vs "Paris SG").
+
+    Args:
+        fixtures_df: sortie de `fetch_upcoming_fixtures` (colonnes
+            `match_id`, `home_team`, `away_team`).
+        odds_df: sortie de `fetch_real_bookmaker_odds`.
+        min_similarity: score de similarité minimal (0-1) pour valider un
+            rapprochement ; en dessous, le match est ignoré plutôt que
+            risquer d'associer une mauvaise cote.
+
+    Returns:
+        DataFrame de cotes indexé par `match_id` (celui d'API-Football),
+        limité aux matchs pour lesquels une correspondance fiable a été
+        trouvée.
+    """
+    matched_rows = []
+    for _, fixture in fixtures_df.iterrows():
+        best_score, best_odds_row = 0.0, None
+        for _, odds_row in odds_df.iterrows():
+            home_sim = _team_name_similarity(fixture["home_team"], odds_row["home_team"])
+            away_sim = _team_name_similarity(fixture["away_team"], odds_row["away_team"])
+            score = (home_sim + away_sim) / 2
+            if score > best_score:
+                best_score, best_odds_row = score, odds_row
+
+        if best_odds_row is not None and best_score >= min_similarity:
+            matched_rows.append(
+                {
+                    "match_id": fixture["match_id"],
+                    "HOME_WIN": best_odds_row["HOME_WIN"],
+                    "DRAW": best_odds_row["DRAW"],
+                    "AWAY_WIN": best_odds_row["AWAY_WIN"],
+                }
+            )
+        else:
+            logger.warning(
+                "Aucune cote correspondante fiable pour %s vs %s (meilleur score: %.2f) -> match ignoré.",
+                fixture["home_team"],
+                fixture["away_team"],
+                best_score,
+            )
+
+    if not matched_rows:
+        return pd.DataFrame(columns=["AWAY_WIN", "DRAW", "HOME_WIN"])
+    return pd.DataFrame(matched_rows).set_index("match_id")[["AWAY_WIN", "DRAW", "HOME_WIN"]]
+
+
+# ---------------------------------------------------------------------------
 # 2. FEATURE ENGINEERING
 # ---------------------------------------------------------------------------
 def build_features(df: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
@@ -251,18 +652,32 @@ def build_features(df: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
     features = pd.DataFrame(index=df.index)
 
     # --- Indice de fatigue (repos + déplacement) ---
-    if {"rest_days_home", "travel_km_home"}.issubset(df.columns):
-        rest_days_home, travel_km_home = df["rest_days_home"], df["travel_km_home"]
+    # Chaque composante (repos, distance) est traitée indépendamment : une
+    # source de données partielle (ex: repos réel mais pas de distance
+    # parcourue) profite quand même de la partie disponible, au lieu de
+    # tout re-simuler dès qu'une seule colonne manque.
+    if "rest_days_home" in df.columns:
+        rest_days_home = df["rest_days_home"]
     else:
-        logger.warning("Données de fatigue (domicile) absentes -> simulation.")
+        logger.warning("Repos (domicile) absent -> simulation.")
         rest_days_home = rng.integers(2, 12, n)
+
+    if "travel_km_home" in df.columns:
+        travel_km_home = df["travel_km_home"]
+    else:
+        logger.warning("Distance parcourue (domicile) absente -> simulation.")
         travel_km_home = rng.uniform(0, 300, n)
 
-    if {"rest_days_away", "travel_km_away"}.issubset(df.columns):
-        rest_days_away, travel_km_away = df["rest_days_away"], df["travel_km_away"]
+    if "rest_days_away" in df.columns:
+        rest_days_away = df["rest_days_away"]
     else:
-        logger.warning("Données de fatigue (extérieur) absentes -> simulation.")
+        logger.warning("Repos (extérieur) absent -> simulation.")
         rest_days_away = rng.integers(2, 12, n)
+
+    if "travel_km_away" in df.columns:
+        travel_km_away = df["travel_km_away"]
+    else:
+        logger.warning("Distance parcourue (extérieur) absente -> simulation.")
         travel_km_away = rng.uniform(50, 3000, n)
 
     features["fatigue_index_home"] = _fatigue_index(
@@ -893,15 +1308,36 @@ def main(
     # 3. Entraînement du modèle IA
     trained_model = train_model(features, target, use_xgboost=True)
 
-    # 4. On simule un "nouveau" créneau de matchs à venir (jeu de test réutilisé
-    #    ici pour l'exemple) sur lequel on applique le modèle + les cotes.
-    upcoming_raw = simulate_raw_match_data(n_matches=200, seed=999)
-    upcoming_features = build_features(upcoming_raw)
+    # 4. Matchs à venir : réels si API_FOOTBALL_KEY est configurée, sinon
+    #    simulés (comportement PoC par défaut, inchangé). NOTE IMPORTANTE :
+    #    l'entraînement (étape 3 ci-dessus) reste sur données simulées tant
+    #    qu'un jeu de données historiques réel n'est pas branché -- brancher
+    #    de vraies APIs ici concerne uniquement les matchs sur lesquels on
+    #    applique le modèle, pas l'apprentissage lui-même.
+    if os.environ.get("API_FOOTBALL_KEY"):
+        league_id = int(os.environ.get("LEAGUE_ID", "61"))  # 61 = Ligue 1
+        season = int(os.environ.get("SEASON", str(datetime.now().year)))
+        upcoming_raw = fetch_upcoming_fixtures(league_id=league_id, season=season, next_n=10)
+    else:
+        logger.info("API_FOOTBALL_KEY absente -> matchs à venir simulés (comportement PoC).")
+        upcoming_raw = simulate_raw_match_data(n_matches=200, seed=999)
 
+    upcoming_features = build_features(upcoming_raw)
     ai_probabilities = trained_model.predict_proba(upcoming_features)
     ai_probabilities.index = upcoming_raw["match_id"]
 
-    bookmaker_odds = simulate_bookmaker_odds(ai_probabilities)
+    # Cotes bookmaker : réelles si ODDS_API_KEY est configurée (nécessite
+    # aussi des matchs réels pour pouvoir les rapprocher par nom d'équipe),
+    # sinon simulées comme avant.
+    if os.environ.get("ODDS_API_KEY") and "home_team" in upcoming_raw.columns:
+        sport_key = os.environ.get("ODDS_SPORT_KEY", "soccer_france_ligue_one")
+        real_odds = fetch_real_bookmaker_odds(sport_key=sport_key)
+        bookmaker_odds = match_fixtures_with_odds(upcoming_raw, real_odds)
+        # Ne garde que les matchs pour lesquels une vraie cote a été trouvée.
+        ai_probabilities = ai_probabilities.loc[ai_probabilities.index.isin(bookmaker_odds.index)]
+    else:
+        logger.info("ODDS_API_KEY absente -> cotes bookmaker simulées (comportement PoC).")
+        bookmaker_odds = simulate_bookmaker_odds(ai_probabilities)
 
     # 5. Détection des value bets + dimensionnement Kelly
     value_bets = detect_value_bets(
