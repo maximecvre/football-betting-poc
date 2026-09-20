@@ -10,7 +10,7 @@ via le Critère de Kelly.
 Architecture du pipeline
 -------------------------
 1. simulate_raw_match_data()  -> génère (ou, en production, récupère via
-   API-Football / OpenWeather / etc.) les données brutes d'un match.
+   football-data.org / OpenWeather / The Odds API) les données brutes.
 2. build_features()           -> transforme les données brutes en
    variables exploitables par le modèle (feature engineering).
 3. train_model()               -> entraîne un classifieur multi-classes
@@ -38,6 +38,7 @@ import difflib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -241,16 +242,21 @@ def _simulate_match_result(
 # branches de vraies sources, moins `build_features()` simule de choses,
 # sans jamais rien casser.
 #
-#   - Calendrier des matchs, repos, blessures : API-Football (api-sports.io)
-#     -> clé attendue dans API_FOOTBALL_KEY (gratuit : 100 requêtes/jour)
+#   - Calendrier des matchs + repos : football-data.org
+#     -> clé attendue dans FOOTBALL_DATA_API_KEY (gratuit : 10 req/min,
+#     couvre la saison EN COURS pour 12 compétitions dont la Ligue 1 —
+#     contrairement à API-Football dont le plan gratuit ne couvre PAS la
+#     saison en cours, seulement 2022-2024, ce qui le rend inutilisable
+#     pour des matchs à venir sans passer sur un plan payant)
 #   - Météo au moment du coup d'envoi : OpenWeather (prévision 5 jours/3h)
 #     -> clé attendue dans OPENWEATHER_KEY (gratuit)
 #   - Cotes de bookmaker réelles : The Odds API
 #     -> clé attendue dans ODDS_API_KEY (gratuit : 500 requêtes/mois)
-#   - Non couverts ici (pas de source gratuite fiable) : xG et historique
-#     détaillé de l'arbitre -> restent simulés par `build_features()`.
+#   - Non couverts ici (pas de source gratuite fiable pour la saison en
+#     cours) : blessures, xG et historique détaillé de l'arbitre --
+#     restent simulés par `build_features()`.
 
-API_FOOTBALL_BASE_URL = "https://v3.football.api-sports.io"
+FOOTBALL_DATA_BASE_URL = "https://api.football-data.org/v4"
 OPENWEATHER_BASE_URL = "https://api.openweathermap.org/data/2.5/forecast"
 ODDS_API_BASE_URL = "https://api.the-odds-api.com/v4/sports"
 
@@ -267,147 +273,158 @@ _OPENWEATHER_TO_CONDITION: dict[str, str] = {
     "Fog": "windy",
 }
 
+# Ville du stade principal pour les clubs de Ligue 1 -- utilisé uniquement
+# pour la météo (OpenWeather a besoin d'un nom de ville, pas d'un club).
+# football-data.org ne fournit pas systématiquement le lieu du match dans
+# sa réponse gratuite ; une petite table statique est donc plus fiable
+# qu'un champ d'API absent. À mettre à jour en cas de promotion/relégation.
+LIGUE1_TEAM_CITIES: dict[str, str] = {
+    "Paris Saint-Germain FC": "Paris",
+    "Olympique de Marseille": "Marseille",
+    "Olympique Lyonnais": "Lyon",
+    "AS Monaco FC": "Monaco",
+    "LOSC Lille": "Lille",
+    "OGC Nice": "Nice",
+    "Stade Rennais FC 1901": "Rennes",
+    "RC Lens": "Lens",
+    "Stade de Reims": "Reims",
+    "RC Strasbourg Alsace": "Strasbourg",
+    "FC Nantes": "Nantes",
+    "Toulouse FC": "Toulouse",
+    "Montpellier HSC": "Montpellier",
+    "Angers SCO": "Angers",
+    "Le Havre AC": "Le Havre",
+    "Stade Brestois 29": "Brest",
+    "AJ Auxerre": "Auxerre",
+    "FC Metz": "Metz",
+    "AS Saint-Étienne": "Saint-Étienne",
+    "Paris FC": "Paris",
+}
+
 
 def fetch_upcoming_fixtures(
-    league_id: int,
-    season: int,
-    next_n: int = 10,
+    competition_code: str = "FL1",
+    next_n: int = 5,
     timeout: int = 15,
+    request_delay: float = 6.5,
 ) -> pd.DataFrame:
-    """Récupère les prochains matchs réels via l'API API-Football.
+    """Récupère les prochains matchs réels via football-data.org.
 
     Retourne un DataFrame avec le même schéma que `simulate_raw_match_data`
     (moins la colonne `result`, inconnue pour un match pas encore joué).
-    Les colonnes non résolues (ex: xG, historique arbitre) sont absentes du
-    DataFrame -- `build_features()` s'en charge automatiquement en fallback.
+    Les colonnes non résolues (ex: blessures, xG, historique arbitre) sont
+    absentes du DataFrame -- `build_features()` s'en charge automatiquement
+    en fallback.
 
-    Nécessite la variable d'environnement API_FOOTBALL_KEY.
+    Nécessite la variable d'environnement FOOTBALL_DATA_API_KEY (clé
+    gratuite sur https://www.football-data.org/client/register).
 
     Args:
-        league_id: identifiant de la compétition (ex: 61 = Ligue 1).
-            Trouvable via l'endpoint /leagues de l'API.
-        season: année de la saison (ex: 2026).
+        competition_code: code de compétition football-data.org
+            (ex: "FL1" = Ligue 1, "PL" = Premier League, "BL1" = Bundesliga,
+            "PD" = Liga, "SA" = Serie A -- liste complète des 12 compétitions
+            gratuites dans la documentation officielle).
         next_n: nombre de matchs à venir à récupérer.
         timeout: délai max (secondes) par requête HTTP.
+        request_delay: pause (secondes) avant chaque requête de repos.
+            Le plan gratuit est limité à 10 requêtes/minute (pas de quota
+            journalier, contrairement à API-Football) ; à 2 requêtes de
+            repos par match, 6.5s de pause maintient le rythme sous cette
+            limite (~9 requêtes/min) même en zappant du delay initial.
+            Le run prend donc environ 13s par match (à titre indicatif :
+            5 matchs ≈ 65s, 10 matchs ≈ 130s) -- augmente `next_n` avec
+            parcimonie si tu veux garder des runs rapides.
 
     Returns:
         DataFrame brut, une ligne par match à venir.
     """
-    api_key = os.environ.get("API_FOOTBALL_KEY")
+    api_key = os.environ.get("FOOTBALL_DATA_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "API_FOOTBALL_KEY manquante : impossible de récupérer de vrais "
-            "matchs à venir. Ajoute cette variable d'environnement (ou "
-            "secret GitHub) pour utiliser cette fonction."
+            "FOOTBALL_DATA_API_KEY manquante : impossible de récupérer de "
+            "vrais matchs à venir. Clé gratuite sur football-data.org."
         )
-    headers = {"x-apisports-key": api_key}
+    headers = {"X-Auth-Token": api_key}
 
     resp = requests.get(
-        f"{API_FOOTBALL_BASE_URL}/fixtures",
+        f"{FOOTBALL_DATA_BASE_URL}/competitions/{competition_code}/matches",
         headers=headers,
-        params={"league": league_id, "season": season, "next": next_n},
+        params={"status": "SCHEDULED"},
         timeout=timeout,
     )
     resp.raise_for_status()
-    fixtures = resp.json().get("response", [])
+    matches = resp.json().get("matches", [])
+    # Tri explicite par date -- l'ordre renvoyé par l'API n'est pas garanti.
+    matches.sort(key=lambda m: m["utcDate"])
+    matches = matches[:next_n]
 
     rows: list[dict] = []
-    for fx in fixtures:
-        fixture_id = fx["fixture"]["id"]
-        kickoff_iso = fx["fixture"]["date"]  # ex: "2026-09-27T15:00:00+00:00"
-        home_id = fx["teams"]["home"]["id"]
-        away_id = fx["teams"]["away"]["id"]
-        venue = fx["fixture"].get("venue") or {}
+    for match in matches:
+        kickoff_iso = match["utcDate"]
+        home, away = match["homeTeam"], match["awayTeam"]
 
         row: dict = {
-            "match_id": fixture_id,
-            "home_team": fx["teams"]["home"]["name"],
-            "away_team": fx["teams"]["away"]["name"],
+            "match_id": match["id"],
+            "home_team": home["name"],
+            "away_team": away["name"],
             "kickoff": kickoff_iso,
         }
 
-        # Repos : nombre de jours depuis le dernier match de chaque équipe.
-        rest_days_home = _fetch_rest_days(home_id, kickoff_iso, headers, timeout)
-        rest_days_away = _fetch_rest_days(away_id, kickoff_iso, headers, timeout)
+        time.sleep(request_delay)
+        rest_days_home = _fetch_fd_rest_days(home["id"], kickoff_iso, headers, timeout)
+        time.sleep(request_delay)
+        rest_days_away = _fetch_fd_rest_days(away["id"], kickoff_iso, headers, timeout)
         if rest_days_home is not None:
             row["rest_days_home"] = rest_days_home
         if rest_days_away is not None:
             row["rest_days_away"] = rest_days_away
 
-        # Blessures : score d'impact = proportion de joueurs indisponibles
-        # parmi les absences reportées pour ce match (approximation simple ;
-        # une vraie pondération par importance du joueur serait plus fine).
-        injury_home = _fetch_injury_impact(home_id, fixture_id, headers, timeout)
-        injury_away = _fetch_injury_impact(away_id, fixture_id, headers, timeout)
-        if injury_home is not None:
-            row["key_injury_impact_home"] = injury_home
-        if injury_away is not None:
-            row["key_injury_impact_away"] = injury_away
-
-        # Météo : uniquement disponible si le match est dans les ~5 jours
-        # (limite de la prévision gratuite OpenWeather).
-        if venue.get("city"):
-            weather = _fetch_weather_condition(venue["city"], kickoff_iso, timeout)
+        # Météo : via la ville du club recevant (table statique ci-dessus),
+        # uniquement disponible si le match est dans les ~5 jours (limite
+        # de la prévision gratuite OpenWeather).
+        city = LIGUE1_TEAM_CITIES.get(home["name"])
+        if city:
+            weather = _fetch_weather_condition(city, kickoff_iso, timeout)
             if weather is not None:
                 row["weather_condition"] = weather
 
         rows.append(row)
 
-    logger.info("%d matchs à venir récupérés depuis API-Football.", len(rows))
+    logger.info("%d matchs à venir récupérés depuis football-data.org.", len(rows))
     return pd.DataFrame(rows)
 
 
-def _fetch_rest_days(
+def _fetch_fd_rest_days(
     team_id: int, before_iso: str, headers: dict, timeout: int
 ) -> Optional[int]:
-    """Nombre de jours de repos d'une équipe avant `before_iso`.
+    """Nombre de jours de repos d'une équipe avant `before_iso` (football-data.org).
 
-    Interroge le dernier match joué par l'équipe avant la date donnée.
-    Retourne None si l'information n'a pas pu être récupérée (l'appelant
-    laisse alors `build_features()` simuler cette valeur).
+    Récupère les derniers matchs terminés de l'équipe et retient le plus
+    récent avant la date donnée. Retourne None si l'information n'a pas pu
+    être récupérée (l'appelant laisse alors `build_features()` simuler
+    cette valeur -- jamais d'erreur bloquante ici).
     """
     try:
-        before_date = datetime.fromisoformat(before_iso).date()
+        before_dt = datetime.fromisoformat(before_iso.replace("Z", "+00:00"))
         resp = requests.get(
-            f"{API_FOOTBALL_BASE_URL}/fixtures",
+            f"{FOOTBALL_DATA_BASE_URL}/teams/{team_id}/matches",
             headers=headers,
-            params={"team": team_id, "last": 1, "to": before_date.isoformat()},
+            params={"status": "FINISHED", "limit": 5},
             timeout=timeout,
         )
         resp.raise_for_status()
-        data = resp.json().get("response", [])
-        if not data:
+        played = resp.json().get("matches", [])
+        past_dates = [
+            datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00"))
+            for m in played
+            if datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")) < before_dt
+        ]
+        if not past_dates:
             return None
-        last_match_date = datetime.fromisoformat(data[0]["fixture"]["date"]).date()
-        return max((before_date - last_match_date).days, 0)
+        last_match_date = max(past_dates)
+        return max((before_dt - last_match_date).days, 0)
     except (requests.RequestException, KeyError, ValueError, IndexError) as exc:
         logger.warning("Impossible de récupérer le repos pour l'équipe %s : %s", team_id, exc)
-        return None
-
-
-def _fetch_injury_impact(
-    team_id: int, fixture_id: int, headers: dict, timeout: int
-) -> Optional[float]:
-    """Score d'impact des blessures (0-1) pour une équipe sur un match donné.
-
-    Approximation simple : proportion (plafonnée) de joueurs listés comme
-    indisponibles pour ce match. À affiner en pondérant par le temps de jeu
-    habituel des joueurs concernés si l'abonnement API le permet.
-    """
-    try:
-        resp = requests.get(
-            f"{API_FOOTBALL_BASE_URL}/injuries",
-            headers=headers,
-            params={"team": team_id, "fixture": fixture_id},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        injured_players = resp.json().get("response", [])
-        # 6 absents ou plus -> impact maximal (1.0), plafonné pour rester
-        # dans une échelle comparable à la version simulée (loi bêta(2,8)).
-        return round(min(len(injured_players) / 6, 1.0), 3)
-    except (requests.RequestException, KeyError, ValueError) as exc:
-        logger.warning("Impossible de récupérer les blessures pour l'équipe %s : %s", team_id, exc)
         return None
 
 
@@ -422,7 +439,7 @@ def _fetch_weather_condition(city: str, kickoff_iso: str, timeout: int) -> Optio
     if not api_key:
         return None
     try:
-        kickoff_dt = datetime.fromisoformat(kickoff_iso)
+        kickoff_dt = datetime.fromisoformat(kickoff_iso.replace("Z", "+00:00"))
         resp = requests.get(
             OPENWEATHER_BASE_URL,
             params={"q": city, "appid": api_key, "units": "metric"},
@@ -570,7 +587,7 @@ def _team_name_similarity(name_a: str, name_b: str) -> float:
 def match_fixtures_with_odds(
     fixtures_df: pd.DataFrame, odds_df: pd.DataFrame, min_similarity: float = 0.5
 ) -> pd.DataFrame:
-    """Associe les cotes réelles (The Odds API) aux matchs d'API-Football.
+    """Associe les cotes réelles (The Odds API) aux matchs de football-data.org.
 
     Les deux fournisseurs utilisent des identifiants différents pour un même
     match : le rapprochement se fait donc par similarité des noms d'équipes
@@ -586,7 +603,7 @@ def match_fixtures_with_odds(
             risquer d'associer une mauvaise cote.
 
     Returns:
-        DataFrame de cotes indexé par `match_id` (celui d'API-Football),
+        DataFrame de cotes indexé par `match_id` (celui de football-data.org),
         limité aux matchs pour lesquels une correspondance fiable a été
         trouvée.
     """
@@ -1309,18 +1326,17 @@ def main(
     # 3. Entraînement du modèle IA
     trained_model = train_model(features, target, use_xgboost=True)
 
-    # 4. Matchs à venir : réels si API_FOOTBALL_KEY est configurée, sinon
-    #    simulés (comportement PoC par défaut, inchangé). NOTE IMPORTANTE :
-    #    l'entraînement (étape 3 ci-dessus) reste sur données simulées tant
-    #    qu'un jeu de données historiques réel n'est pas branché -- brancher
-    #    de vraies APIs ici concerne uniquement les matchs sur lesquels on
-    #    applique le modèle, pas l'apprentissage lui-même.
-    if os.environ.get("API_FOOTBALL_KEY"):
-        league_id = int(os.environ.get("LEAGUE_ID", "61"))  # 61 = Ligue 1
-        season = int(os.environ.get("SEASON", str(datetime.now().year)))
-        upcoming_raw = fetch_upcoming_fixtures(league_id=league_id, season=season, next_n=next_n_fixtures)
+    # 4. Matchs à venir : réels si FOOTBALL_DATA_API_KEY est configurée,
+    #    sinon simulés (comportement PoC par défaut, inchangé). NOTE
+    #    IMPORTANTE : l'entraînement (étape 3 ci-dessus) reste sur données
+    #    simulées tant qu'un jeu de données historiques réel n'est pas
+    #    branché -- brancher de vraies APIs ici concerne uniquement les
+    #    matchs sur lesquels on applique le modèle, pas l'apprentissage.
+    if os.environ.get("FOOTBALL_DATA_API_KEY"):
+        competition_code = os.environ.get("COMPETITION_CODE", "FL1")  # FL1 = Ligue 1
+        upcoming_raw = fetch_upcoming_fixtures(competition_code=competition_code, next_n=next_n_fixtures)
     else:
-        logger.info("API_FOOTBALL_KEY absente -> matchs à venir simulés (comportement PoC).")
+        logger.info("FOOTBALL_DATA_API_KEY absente -> matchs à venir simulés (comportement PoC).")
         upcoming_raw = simulate_raw_match_data(n_matches=200, seed=999)
 
     upcoming_features = build_features(upcoming_raw)
@@ -1406,11 +1422,12 @@ if __name__ == "__main__":
 
     n_matches_arg = int(os.environ.get("N_MATCHES", 6000))
     bankroll_arg = float(os.environ.get("BANKROLL", 1000.0))
-    # Nombre de matchs à venir récupérés via API-Football. Chaque match
-    # coûte ~4 requêtes (repos + blessures pour les 2 équipes), + 1 requête
-    # fixe pour la liste des matchs -> budget = 1 + 4 * next_n_fixtures.
-    # Défaut à 5 : ~21 requêtes/run, largement sous le quota gratuit de
-    # 100/jour même en relançant le workflow plusieurs fois dans la journée.
+    # Nombre de matchs à venir récupérés via football-data.org. Chaque
+    # match coûte 2 requêtes (repos domicile + extérieur), + 1 requête fixe
+    # pour la liste des matchs -> budget = 1 + 2 * next_n_fixtures. Le plan
+    # gratuit n'a pas de quota journalier (juste 10 requêtes/min, déjà géré
+    # par le délai interne à fetch_upcoming_fixtures) -- next_n=5 prend
+    # environ 65 secondes à s'exécuter, augmente avec parcimonie.
     next_n_arg = int(os.environ.get("NEXT_N", 5))
 
     main(n_matches=n_matches_arg, bankroll=bankroll_arg, next_n_fixtures=next_n_arg)
