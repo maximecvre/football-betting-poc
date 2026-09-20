@@ -16,7 +16,7 @@ on:
         required: false
         default: "1000"
       next_n:
-        description: "Nombre de prochains matchs Ligue 1 Ã  analyser (budget API-Football : 1 + 4Ã—ce nombre requÃªtes)"
+        description: "Nombre de prochains matchs Ligue 1 Ã  analyser (~13s/match, plan gratuit football-data.org)"
         required: false
         default: "5"
 
@@ -59,10 +59,10 @@ jobs:
           # Ces 3 secrets sont optionnels : absents, le script reste en
           # mode simulÃ© (comportement inchangÃ©). PrÃ©sents, il bascule
           # automatiquement sur les vraies donnÃ©es correspondantes.
-          API_FOOTBALL_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+          FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
           OPENWEATHER_KEY: ${{ secrets.OPENWEATHER_KEY }}
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-          LEAGUE_ID: "61"          # 61 = Ligue 1 sur API-Football
+          COMPETITION_CODE: "FL1"  # FL1 = Ligue 1 sur football-data.org
           ODDS_SPORT_KEY: "soccer_france_ligue_one"
         run: python football_value_betting_poc.py
 
