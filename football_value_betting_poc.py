@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+import io
 import numpy as np
 import pandas as pd
 import requests
@@ -426,6 +427,86 @@ def fetch_upcoming_fixtures(
 
     logger.info("%d matchs à venir récupérés depuis football-data.org.", len(rows))
     return pd.DataFrame(rows)
+
+# ---------------------------------------------------------------------------
+# 1ter. CONNEXION AUX DONNÉES HISTORIQUES (football-data.co.uk)
+# ---------------------------------------------------------------------------
+RESULT_MAPPING = {
+    "H": "HOME_WIN",
+    "D": "DRAW",
+    "A": "AWAY_WIN",
+}
+
+def fetch_historical_ligue1_data(
+    seasons: list[str] = ["2223", "2324", "2425", "2526"],
+) -> pd.DataFrame:
+    all_dfs = []
+    base_url = "https://www.football-data.co.uk/mmz4281"
+
+    for season in seasons:
+        url = f"{base_url}/{season}/F1.csv"
+        try:
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200:
+                df_season = pd.read_csv(io.StringIO(resp.text), on_bad_lines="skip")
+                df_season["Season"] = season
+                all_dfs.append(df_season)
+                logger.info("Saison %s chargée (%d matchs).", season, len(df_season))
+            else:
+                logger.warning("Impossible de charger la saison %s (HTTP %s).", season, resp.status_code)
+        except Exception as exc:
+            logger.error("Erreur lors du téléchargement de %s : %s", url, exc)
+
+    if not all_dfs:
+        raise RuntimeError("Aucune donnée historique n'a pu être téléchargée depuis football-data.co.uk.")
+
+    raw = pd.concat(all_dfs, ignore_index=True)
+
+    raw["Date"] = pd.to_datetime(raw["Date"], format="mixed", dayfirst=True, errors="coerce")
+    raw = raw.dropna(subset=["Date", "HomeTeam", "AwayTeam", "FTR"]).sort_values("Date")
+
+    raw["rest_days_home"] = _compute_historical_rest_days(raw, is_home=True)
+    raw["rest_days_away"] = _compute_historical_rest_days(raw, is_home=False)
+
+    processed = pd.DataFrame(index=raw.index)
+    processed["match_id"] = np.arange(len(raw))
+    processed["home_team"] = raw["HomeTeam"]
+    processed["away_team"] = raw["AwayTeam"]
+    
+    processed["rest_days_home"] = raw["rest_days_home"].fillna(7)
+    processed["rest_days_away"] = raw["rest_days_away"].fillna(7)
+
+    processed["referee_red_card_avg"] = ((raw.get("HR", 0).fillna(0) + raw.get("AR", 0).fillna(0)).rolling(window=20, min_periods=1).mean())
+    processed["referee_penalty_avg"] = 0.30
+
+    if "HST" in raw.columns and "AST" in raw.columns:
+        processed["xg_home"] = np.clip(raw["HST"] * 0.30 + 0.2, 0.1, None)
+        processed["xg_away"] = np.clip(raw["AST"] * 0.30 + 0.2, 0.1, None)
+
+    processed["result"] = raw["FTR"].map(RESULT_MAPPING)
+
+    logger.info("Jeu d'entraînement historique prêt : %d matchs réels.", len(processed))
+    return processed
+
+
+def _compute_historical_rest_days(df: pd.DataFrame, is_home: bool = True) -> pd.Series:
+    last_played = {}
+    rest_list = []
+
+    for _, row in df.iterrows():
+        team = row["HomeTeam"] if is_home else row["AwayTeam"]
+        current_date = row["Date"]
+
+        if team in last_played:
+            diff_days = (current_date - last_played[team]).days
+            rest_list.append(max(diff_days, 2))
+        else:
+            rest_list.append(7.0) 
+
+        last_played[row["HomeTeam"]] = current_date
+        last_played[row["AwayTeam"]] = current_date
+
+    return pd.Series(rest_list, index=df.index)
 
 
 def _fetch_fd_rest_days(
@@ -1477,7 +1558,11 @@ def main(
     """Exécute le pipeline complet de bout en bout, à titre de démonstration."""
 
     # 1. Données brutes (à remplacer par de vraies APIs en production)
-    raw_df = simulate_raw_match_data(n_matches=n_matches)
+    # raw_df = simulate_raw_match_data(n_matches=n_matches)
+
+    # 1. Données brutes : Historique réel de Ligue 1 (football-data.co.uk)
+    raw_df = fetch_historical_ligue1_data(seasons=["2223", "2324", "2425", "2526"])
+
 
     # 2. Feature engineering
     features = build_features(raw_df)
