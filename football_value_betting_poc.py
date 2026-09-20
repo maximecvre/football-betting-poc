@@ -753,6 +753,54 @@ def match_fixtures_with_odds(
         return pd.DataFrame(columns=["AWAY_WIN", "DRAW", "HOME_WIN"])
     return pd.DataFrame(matched_rows).set_index("match_id")[["AWAY_WIN", "DRAW", "HOME_WIN"]]
 
+class EloSystem:
+    def __init__(self, base_rating: float = 1500.0, k_factor: float = 20.0, home_advantage: float = 100.0):
+        self.ratings: dict[str, float] = {}
+        self.base_rating = base_rating
+        self.k_factor = k_factor
+        self.home_advantage = home_advantage
+
+    def get_rating(self, team: str) -> float:
+        """Retourne l'Elo actuel d'une équipe. 1500 par défaut si nouvelle."""
+        return self.ratings.get(team, self.base_rating)
+
+    def expected_result(self, rating_a: float, rating_b: float) -> float:
+        """Calcule la probabilité de victoire de A contre B."""
+        return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+
+    def update_ratings(self, home_team: str, away_team: str, home_goals: int, away_goals: int):
+        """Met à jour les scores Elo après un match."""
+        home_rating = self.get_rating(home_team)
+        away_rating = self.get_rating(away_team)
+
+        # 1. Calcul de l'attente (avec avantage du terrain pour l'équipe à domicile)
+        expected_home = self.expected_result(home_rating + self.home_advantage, away_rating)
+        expected_away = 1 - expected_home
+
+        # 2. Résultat réel (1 = victoire domicile, 0.5 = nul, 0 = victoire extérieur)
+        if home_goals > away_goals:
+            actual_home, actual_away = 1.0, 0.0
+        elif home_goals < away_goals:
+            actual_home, actual_away = 0.0, 1.0
+        else:
+            actual_home, actual_away = 0.5, 0.5
+
+        # 3. Multiplicateur de marge de victoire (Goal Difference)
+        # Plus l'écart de buts est grand, plus le transfert d'Elo est important
+        goal_diff = abs(home_goals - away_goals)
+        if goal_diff <= 1:
+            g_multiplier = 1.0
+        elif goal_diff == 2:
+            g_multiplier = 1.5
+        else:
+            g_multiplier = (11 + goal_diff) / 8.0
+
+        # 4. Mise à jour
+        elo_shift = self.k_factor * g_multiplier * (actual_home - expected_home)
+        
+        self.ratings[home_team] = home_rating + elo_shift
+        self.ratings[away_team] = away_rating - elo_shift
+
 
 # ---------------------------------------------------------------------------
 # 2. FEATURE ENGINEERING
@@ -782,7 +830,44 @@ def build_features(df: pd.DataFrame, seed: int = 7) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     n = len(df)
     features = pd.DataFrame(index=df.index)
+"""Construit les variables avec calcul chronologique de l'Elo."""
+    # S'assurer que le DataFrame est trié par date ! C'est CRUCIAL pour l'Elo.
+    df = df.sort_values("Date")
+    
+    elo_sys = EloSystem(base_rating=1500, k_factor=20, home_advantage=90)
+    
+    home_elos = []
+    away_elos = []
+    
+    # On parcourt les matchs un par un dans l'ordre du temps
+    for _, row in df.iterrows():
+        home_team = row["home_team"]
+        away_team = row["away_team"]
+        
+        # 1. On capture l'Elo AVANT le match pour nos features ML
+        current_home_elo = elo_sys.get_rating(home_team)
+        current_away_elo = elo_sys.get_rating(away_team)
+        
+        home_elos.append(current_home_elo)
+        away_elos.append(current_away_elo)
+        
+        # 2. Si le match a été joué (on a le résultat), on met à jour le système
+        # Attention: pour les matchs à venir (inférence), FTR ou FTHG sera manquant
+        if "FTHG" in df.columns and pd.notna(row.get("FTHG")):
+            elo_sys.update_ratings(
+                home_team, 
+                away_team, 
+                home_goals=int(row["FTHG"]), # Full Time Home Goals (donnée footbal-data)
+                away_goals=int(row["FTAG"])
+            )
 
+    features = pd.DataFrame(index=df.index)
+    
+    # Ajout des features Elo au dataset
+    features["elo_home"] = home_elos
+    features["elo_away"] = away_elos
+    # Le modèle aime souvent avoir l'écart brut, ajusté du Home Advantage
+    features["elo_diff_adjusted"] = (features["elo_home"] + elo_sys.home_advantage) - features["elo_away"]
     # --- Indice de fatigue (repos + déplacement) ---
     # Chaque composante (repos, distance) est traitée indépendamment : une
     # source de données partielle (ex: repos réel mais pas de distance
