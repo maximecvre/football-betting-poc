@@ -42,6 +42,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -81,6 +82,39 @@ RESULT_LABELS_FR: dict[str, str] = {
     "DRAW": "Match Nul",
     "AWAY_WIN": "Victoire Extérieure",
 }
+
+_FR_WEEKDAYS = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+_FR_MONTHS = [
+    "janvier", "février", "mars", "avril", "mai", "juin",
+    "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+]
+
+
+def _format_kickoff_fr(kickoff_iso: Optional[str]) -> str:
+    """Formate une date de coup d'envoi ISO 8601 en français, heure de Paris.
+
+    N'utilise pas `locale`/`strftime("%A")` (nécessiterait une locale
+    système fr_FR pas forcément installée sur le runner CI) -- une petite
+    table de correspondance suffit et reste portable partout.
+
+    Args:
+        kickoff_iso: date ISO 8601 (ex: "2026-09-27T19:00:00Z"), ou None
+            si le match n'a pas de date réelle (mode simulation).
+
+    Returns:
+        Ex: "Samedi 27 septembre 2026 à 19h00 (heure de Paris)", ou un
+        message explicite si la date est absente/invalide.
+    """
+    if not kickoff_iso:
+        return "Date non disponible (mode démonstration)"
+    try:
+        dt_utc = datetime.fromisoformat(kickoff_iso.replace("Z", "+00:00"))
+        dt_paris = dt_utc.astimezone(ZoneInfo("Europe/Paris"))
+        weekday = _FR_WEEKDAYS[dt_paris.weekday()].capitalize()
+        month = _FR_MONTHS[dt_paris.month - 1]
+        return f"{weekday} {dt_paris.day} {month} {dt_paris.year} à {dt_paris.strftime('%Hh%M')} (heure de Paris)"
+    except (ValueError, IndexError):
+        return kickoff_iso
 
 
 # ---------------------------------------------------------------------------
@@ -970,6 +1004,9 @@ class ValueBet:
     expected_value: float
     kelly_stake_fraction: float
     recommended_stake: float
+    home_team: str = "Équipe domicile"
+    away_team: str = "Équipe extérieure"
+    kickoff: Optional[str] = None
 
 
 def detect_value_bets(
@@ -979,6 +1016,7 @@ def detect_value_bets(
     ev_threshold: float = 0.0,
     kelly_fraction: float = 0.5,
     max_stake_fraction: float = 0.05,
+    match_info: Optional[pd.DataFrame] = None,
 ) -> list[ValueBet]:
     """Croise probabilités IA et cotes bookmaker pour détecter les value bets.
 
@@ -999,6 +1037,11 @@ def detect_value_bets(
         kelly_fraction: fraction du Kelly plein appliquée (gestion du risque).
         max_stake_fraction: plafond de sécurité (% max de la bankroll misé
             sur un seul pari), indépendant du résultat du calcul de Kelly.
+        match_info: DataFrame optionnel indexé par `match_id`, colonnes
+            `home_team`/`away_team`/`kickoff` -- permet d'afficher les vrais
+            noms d'équipes et la date dans le rapport plutôt qu'un simple
+            identifiant numérique. Si absent (mode simulation), des
+            libellés génériques sont utilisés à la place.
 
     Returns:
         Liste des `ValueBet` détectés, triée par espérance décroissante.
@@ -1006,6 +1049,14 @@ def detect_value_bets(
     value_bets: list[ValueBet] = []
 
     for match_id in ai_probabilities.index:
+        if match_info is not None and match_id in match_info.index:
+            home_team = str(match_info.loc[match_id, "home_team"])
+            away_team = str(match_info.loc[match_id, "away_team"])
+            kickoff = match_info.loc[match_id, "kickoff"] if "kickoff" in match_info.columns else None
+            kickoff = None if pd.isna(kickoff) else kickoff
+        else:
+            home_team, away_team, kickoff = "Équipe domicile", "Équipe extérieure", None
+
         for outcome in ai_probabilities.columns:
             p = float(ai_probabilities.loc[match_id, outcome])
             odds = float(bookmaker_odds.loc[match_id, outcome])
@@ -1027,6 +1078,9 @@ def detect_value_bets(
                             expected_value=round(expected_value, 4),
                             kelly_stake_fraction=round(capped_fraction, 4),
                             recommended_stake=recommended_stake,
+                            home_team=home_team,
+                            away_team=away_team,
+                            kickoff=kickoff,
                         )
                     )
 
@@ -1057,14 +1111,16 @@ def generate_html_report(
     n_train_matches: int,
     n_upcoming_matches: int,
     bankroll: float,
+    using_real_fixtures: bool = False,
 ) -> str:
     """Construit un rapport HTML autonome (CSS inclus, sans dépendance externe).
 
     Le rapport traduit les résultats bruts (probabilités, cotes, EV, Kelly)
-    en informations directement lisibles : performance du modèle, liste des
-    opportunités détectées avec une explication en langage clair de
-    l'écart entre l'estimation de l'IA et celle du bookmaker, et un rappel
-    du caractère expérimental du PoC.
+    en informations directement lisibles, y compris pour quelqu'un qui ne
+    connaît pas le vocabulaire du paris sportif ou du machine learning :
+    équipes et date de chaque match, explication en langage courant de
+    chaque terme technique, et un rappel clair du caractère expérimental
+    du PoC.
 
     Args:
         trained_model: modèle entraîné (pour les métriques d'évaluation).
@@ -1072,6 +1128,9 @@ def generate_html_report(
         n_train_matches: nombre de matchs utilisés pour l'entraînement.
         n_upcoming_matches: nombre de matchs évalués pour la détection.
         bankroll: bankroll de référence utilisée pour le dimensionnement.
+        using_real_fixtures: True si les matchs analysés sont de vrais
+            matchs à venir (football-data.org), False s'ils sont simulés
+            (mode démonstration) -- ajuste le bandeau d'avertissement.
 
     Returns:
         Le document HTML complet, prêt à être écrit sur disque.
@@ -1086,23 +1145,37 @@ def generate_html_report(
         edge_points = (vb.ai_probability - implied_proba) * 100
         strength_label, strength_class = _signal_strength_label(vb.expected_value)
         outcome_fr = RESULT_LABELS_FR.get(vb.outcome, vb.outcome)
+        kickoff_label = _format_kickoff_fr(vb.kickoff)
+
+        # Phrase de l'issue prédite formulée explicitement avec les noms
+        # d'équipe (plus lisible que le libellé technique seul, ex.
+        # "Victoire Domicile" ne dit rien si on ne sait pas qui reçoit).
+        if vb.outcome == "HOME_WIN":
+            outcome_sentence = f"{vb.home_team} gagne à domicile"
+        elif vb.outcome == "AWAY_WIN":
+            outcome_sentence = f"{vb.away_team} gagne à l'extérieur"
+        else:
+            outcome_sentence = "Match nul"
 
         rows_html.append(
             f"""
             <div class="bet-card">
                 <div class="bet-card-header">
-                    <span class="match-id">Match #{vb.match_id}</span>
+                    <div>
+                        <div class="match-title">{vb.home_team} <span class="vs">vs</span> {vb.away_team}</div>
+                        <div class="match-date">📅 {kickoff_label}</div>
+                    </div>
                     <span class="tag {strength_class}">{strength_label}</span>
                 </div>
-                <div class="bet-outcome">{outcome_fr}</div>
+                <div class="bet-outcome">Pari analysé : {outcome_sentence}</div>
                 <div class="bet-grid">
                     <div class="metric">
-                        <span class="metric-label">Probabilité IA</span>
-                        <span class="metric-value">{vb.ai_probability:.1%}</span>
+                        <span class="metric-label">Estimation de l'IA</span>
+                        <span class="metric-value">{vb.ai_probability:.1%} de chances</span>
                     </div>
                     <div class="metric">
-                        <span class="metric-label">Probabilité bookmaker</span>
-                        <span class="metric-value">{implied_proba:.1%}</span>
+                        <span class="metric-label">Estimation du bookmaker</span>
+                        <span class="metric-value">{implied_proba:.1%} de chances</span>
                     </div>
                     <div class="metric">
                         <span class="metric-label">Cote proposée</span>
@@ -1110,24 +1183,29 @@ def generate_html_report(
                     </div>
                     <div class="metric">
                         <span class="metric-label">Écart estimé</span>
-                        <span class="metric-value positive">+{edge_points:.1f} pts</span>
+                        <span class="metric-value positive">+{edge_points:.1f} points</span>
                     </div>
                     <div class="metric">
-                        <span class="metric-label">Espérance (EV)</span>
+                        <span class="metric-label">Gain moyen attendu (EV)</span>
                         <span class="metric-value positive">+{vb.expected_value:.1%}</span>
                     </div>
                     <div class="metric">
                         <span class="metric-label">Mise conseillée</span>
                         <span class="metric-value stake">{vb.recommended_stake:.2f} €
-                            <small>({vb.kelly_stake_fraction:.1%} bankroll)</small>
+                            <small>({vb.kelly_stake_fraction:.1%} de la bankroll)</small>
                         </span>
                     </div>
                 </div>
                 <p class="bet-explainer">
-                    L'IA estime cette issue à <strong>{vb.ai_probability:.1%}</strong> alors que
-                    la cote du bookmaker (<strong>{vb.bookmaker_odds:.2f}</strong>) n'implique
-                    qu'une probabilité de <strong>{implied_proba:.1%}</strong> — un écart de
-                    <strong>{edge_points:.1f} points</strong> en faveur du pari, selon le modèle.
+                    <strong>En clair :</strong> pour ce match, notre IA pense que
+                    « {outcome_sentence} » a environ <strong>{vb.ai_probability:.1%}</strong> de
+                    chances de se réaliser. Le bookmaker, avec sa cote de
+                    <strong>{vb.bookmaker_odds:.2f}</strong>, ne lui donne implicitement que
+                    <strong>{implied_proba:.1%}</strong> de chances. L'IA est donc plus optimiste
+                    que le bookmaker sur cette issue — c'est cet écart (
+                    <strong>+{edge_points:.1f} points</strong>) qui rend le pari potentiellement
+                    intéressant sur le papier. Cela reste une estimation statistique,
+                    pas une certitude : le résultat réel du match peut très bien être différent.
                 </p>
             </div>"""
         )
@@ -1135,8 +1213,36 @@ def generate_html_report(
     bets_section = (
         "\n".join(rows_html)
         if value_bets
-        else '<p class="no-bets">Aucune opportunité à valeur positive détectée sur ce lot de matchs.</p>'
+        else '<p class="no-bets">Aucune opportunité à valeur positive détectée sur ce lot de matchs : '
+        "d'après le modèle, les cotes du bookmaker reflètent déjà correctement les chances de "
+        "chaque équipe sur cette sélection.</p>"
     )
+
+    data_mode_banner = (
+        """<div class="mode-banner mode-real">
+             🟢 <strong>Matchs réels</strong> — les équipes et dates ci-dessous sont de vrais
+             matchs à venir. Les probabilités du modèle restent une estimation, pas une garantie.
+           </div>"""
+        if using_real_fixtures
+        else """<div class="mode-banner mode-demo">
+             🟡 <strong>Mode démonstration</strong> — aucune clé d'API réelle n'était configurée
+             pour ce run : les matchs ci-dessous sont générés artificiellement pour illustrer le
+             fonctionnement du système, ce ne sont pas de vrais matchs.
+           </div>"""
+    )
+
+    if using_real_fixtures:
+        disclaimer_data_note = (
+            "les matchs affichés ci-dessus sont de vrais matchs à venir (données football-data.org). "
+            "Le modèle qui les évalue, en revanche, a été entraîné sur un historique simulé "
+            "(numpy.random) et non sur de vrais résultats passés — c'est encore un PoC, pas un "
+            "système entraîné sur données réelles de bout en bout."
+        )
+    else:
+        disclaimer_data_note = (
+            "les matchs, l'historique d'entraînement et les cotes affichées ci-dessus sont "
+            "entièrement simulés (aucune clé d'API réelle n'était configurée pour ce run)."
+        )
 
     html = f"""<!DOCTYPE html>
 <html lang="fr">
@@ -1200,6 +1306,8 @@ def generate_html_report(
   }}
   .kpi-value {{ font-size: 1.3rem; font-weight: 700; display: block; }}
   .kpi-label {{ font-size: 0.75rem; color: var(--text-muted); }}
+  .kpi-interpret {{ font-size: 0.85rem; color: var(--text-muted); margin: -10px 0 24px; }}
+  .section-intro {{ font-size: 0.85rem; color: var(--text-muted); margin: -6px 0 16px; }}
   h2 {{ font-size: 1.1rem; margin: 28px 0 12px; }}
   .bet-card {{
     background: var(--card-bg);
@@ -1211,21 +1319,25 @@ def generate_html_report(
   .bet-card-header {{
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: flex-start;
+    gap: 10px;
     margin-bottom: 6px;
   }}
-  .match-id {{ font-size: 0.8rem; color: var(--text-muted); }}
+  .match-title {{ font-size: 1.02rem; font-weight: 700; }}
+  .match-title .vs {{ color: var(--text-muted); font-weight: 400; font-size: 0.85em; }}
+  .match-date {{ font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; }}
   .tag {{
     font-size: 0.72rem;
     font-weight: 600;
     padding: 3px 9px;
     border-radius: 999px;
     color: #fff;
+    white-space: nowrap;
   }}
   .tag-strong {{ background: var(--strong); }}
   .tag-medium {{ background: var(--medium); }}
   .tag-weak {{ background: var(--weak); }}
-  .bet-outcome {{ font-size: 1.15rem; font-weight: 700; margin-bottom: 12px; }}
+  .bet-outcome {{ font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: var(--accent); }}
   .bet-grid {{
     display: grid;
     grid-template-columns: repeat(2, 1fr);
@@ -1245,6 +1357,26 @@ def generate_html_report(
     margin: 0;
   }}
   .no-bets {{ color: var(--text-muted); font-style: italic; }}
+  .mode-banner {{
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-size: 0.85rem;
+    margin-bottom: 20px;
+    line-height: 1.45;
+  }}
+  .mode-real {{ background: rgba(26, 143, 94, 0.12); border: 1px solid var(--positive); }}
+  .mode-demo {{ background: rgba(184, 134, 11, 0.12); border: 1px solid var(--medium); }}
+  .glossary {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 18px;
+    margin-bottom: 24px;
+  }}
+  .glossary h2 {{ margin: 0 0 10px; }}
+  .glossary dt {{ font-weight: 700; margin-top: 10px; }}
+  .glossary dt:first-of-type {{ margin-top: 0; }}
+  .glossary dd {{ margin: 2px 0 0; color: var(--text-muted); font-size: 0.88rem; }}
   .disclaimer {{
     margin-top: 32px;
     padding: 14px 16px;
@@ -1264,14 +1396,16 @@ def generate_html_report(
     <p class="subtitle">Généré le {generated_at} · Modèle : {algo_name} · PoC expérimental</p>
   </header>
 
+  {data_mode_banner}
+
   <div class="kpi-grid">
     <div class="kpi">
       <span class="kpi-value">{trained_model.test_accuracy:.1%}</span>
-      <span class="kpi-label">Précision (test)</span>
+      <span class="kpi-label">Précision du modèle</span>
     </div>
     <div class="kpi">
       <span class="kpi-value">{trained_model.test_log_loss:.3f}</span>
-      <span class="kpi-label">Log loss (test)</span>
+      <span class="kpi-label">Log loss (fiabilité)</span>
     </div>
     <div class="kpi">
       <span class="kpi-value">{n_train_matches:,}</span>
@@ -1279,21 +1413,47 @@ def generate_html_report(
     </div>
     <div class="kpi">
       <span class="kpi-value">{len(value_bets)}</span>
-      <span class="kpi-label">Opportunités / {n_upcoming_matches * 3} issues</span>
+      <span class="kpi-label">Opportunités trouvées</span>
     </div>
+  </div>
+  <p class="kpi-interpret">
+    En clair : sur des matchs qu'il n'avait jamais vus, le modèle a deviné le bon résultat
+    (victoire domicile, nul ou victoire extérieure) dans <strong>{trained_model.test_accuracy:.0%}</strong>
+    des cas — à comparer aux <strong>33%</strong> qu'on obtiendrait en devinant au hasard entre les
+    3 issues possibles. Sur les {n_upcoming_matches} match(s) analysé(s) ci-dessous
+    ({n_upcoming_matches * 3} issues possibles au total), <strong>{len(value_bets)}</strong>
+    ont été jugées potentiellement intéressantes.
+  </p>
+
+  <div class="glossary">
+    <h2>📖 Comment lire ce rapport ?</h2>
+    <dl>
+      <dt>Estimation de l'IA</dt>
+      <dd>La probabilité que notre modèle attribue à un résultat, après avoir analysé forme, repos, météo, etc.</dd>
+      <dt>Estimation du bookmaker</dt>
+      <dd>La probabilité "cachée" dans la cote du bookmaker. Une cote de 2.00 correspond à 50% de chances (1 ÷ 2.00).</dd>
+      <dt>Écart estimé</dt>
+      <dd>La différence entre les deux estimations ci-dessus. Plus il est grand, plus l'IA est en désaccord avec le bookmaker sur ce résultat.</dd>
+      <dt>Gain moyen attendu (EV)</dt>
+      <dd>Si l'estimation de l'IA est juste et qu'on répétait ce pari des centaines de fois, c'est le gain moyen par euro misé. +10% veut dire "10 centimes de gain espéré par euro", pas un gain garanti sur un seul pari.</dd>
+      <dt>Mise conseillée (Critère de Kelly)</dt>
+      <dd>Une formule mathématique qui calcule quelle part de la bankroll miser selon la confiance du modèle et la cote — plus l'avantage est net, plus la mise proposée est élevée, dans une limite de sécurité de 5% par pari.</dd>
+      <dt>Signal fort / modéré / faible</dt>
+      <dd>Un indicateur visuel rapide de la taille de l'écart trouvé (fort = EV ≥ 15%, modéré = EV ≥ 5%, faible = en dessous). Un signal faible reste plus incertain.</dd>
+    </dl>
   </div>
 
   <h2>Opportunités détectées (triées par espérance)</h2>
+  <p class="section-intro">Chaque carte ci-dessous correspond à un pari sur un résultat précis d'un match. Elles sont classées de l'opportunité la plus intéressante (selon le modèle) à la moins intéressante.</p>
   {bets_section}
 
   <div class="disclaimer">
-    <strong>À propos de ce rapport :</strong> les données sont simulées
-    (PoC de démonstration technique, pas de connexion à une API de cotes
-    réelle). Les probabilités et cotes affichées n'ont donc pas de valeur
-    prédictive réelle sur de vrais matchs. Aucun modèle ne garantit un
-    gain ; la mise "Kelly" affichée applique déjà une fraction réduite
-    (half-Kelly) et un plafond de sécurité pour limiter le risque, mais
-    reste un exercice mathématique, pas un conseil financier.
+    <strong>À propos de ce rapport :</strong> {disclaimer_data_note}
+    Aucun modèle ne garantit un gain ; la mise « Kelly » affichée applique déjà une fraction
+    réduite (half-Kelly) et un plafond de sécurité pour limiter le risque, mais reste un exercice
+    mathématique de gestion de bankroll, pas un conseil financier. Le fait qu'un pari soit
+    « intéressant sur le papier » selon ce modèle ne veut pas dire qu'il va gagner : le sport reste
+    imprévisible, et ce modèle est un prototype, pas un système éprouvé.
     Bankroll de référence utilisée pour ce calcul : {bankroll:,.0f} €.
   </div>
 
@@ -1343,10 +1503,28 @@ def main(
     ai_probabilities = trained_model.predict_proba(upcoming_features)
     ai_probabilities.index = upcoming_raw["match_id"]
 
+    # Infos d'affichage (équipes + date) pour rendre le rapport lisible par
+    # quelqu'un qui ne connaît pas les identifiants internes des matchs.
+    using_real_fixtures = "home_team" in upcoming_raw.columns
+    if using_real_fixtures:
+        match_info = upcoming_raw.set_index("match_id")[
+            [col for col in ("home_team", "away_team", "kickoff") if col in upcoming_raw.columns]
+        ]
+        if "kickoff" not in match_info.columns:
+            match_info["kickoff"] = None
+    else:
+        # Mode simulation : pas de vraies équipes -- libellés génériques
+        # explicites plutôt que d'inventer des noms qui pourraient être
+        # confondus avec de vrais clubs.
+        match_info = pd.DataFrame(index=upcoming_raw["match_id"])
+        match_info["home_team"] = "Équipe simulée A"
+        match_info["away_team"] = "Équipe simulée B"
+        match_info["kickoff"] = None
+
     # Cotes bookmaker : réelles si ODDS_API_KEY est configurée (nécessite
     # aussi des matchs réels pour pouvoir les rapprocher par nom d'équipe),
     # sinon simulées comme avant.
-    if os.environ.get("ODDS_API_KEY") and "home_team" in upcoming_raw.columns:
+    if os.environ.get("ODDS_API_KEY") and using_real_fixtures:
         sport_key = os.environ.get("ODDS_SPORT_KEY", "soccer_france_ligue_one")
         real_odds = fetch_real_bookmaker_odds(sport_key=sport_key)
         bookmaker_odds = match_fixtures_with_odds(upcoming_raw, real_odds)
@@ -1364,6 +1542,7 @@ def main(
         ev_threshold=0.0,
         kelly_fraction=0.5,       # half-Kelly : réduit la variance
         max_stake_fraction=0.05,  # jamais plus de 5% de la bankroll sur un pari
+        match_info=match_info,
     )
 
     # --- Affichage synthétique ---
@@ -1376,28 +1555,28 @@ def main(
 
     for vb in value_bets[:top_n_display]:
         print(
-            f"Match #{vb.match_id:>4} | {vb.outcome:<9} | "
+            f"{vb.home_team} vs {vb.away_team} | {vb.outcome:<9} | "
             f"P(IA)={vb.ai_probability:.3f} | cote={vb.bookmaker_odds:.2f} | "
             f"EV={vb.expected_value:+.3f} | mise={vb.recommended_stake:.2f}€ "
             f"({vb.kelly_stake_fraction:.1%} bankroll)"
         )
 
     if not value_bets:
-        print("Aucune value bet détectée sur ce lot de matchs simulés.")
+        print("Aucune value bet détectée sur ce lot de matchs.")
 
     print("=" * 70 + "\n")
 
     # Export CSV des value bets détectés (utile pour un run automatisé,
     # par exemple récupéré comme artifact GitHub Actions).
+    csv_columns = [
+        "match_id", "home_team", "away_team", "kickoff", "outcome",
+        "ai_probability", "bookmaker_odds", "expected_value",
+        "kelly_stake_fraction", "recommended_stake",
+    ]
     if value_bets:
-        vb_df = pd.DataFrame([vb.__dict__ for vb in value_bets])
+        vb_df = pd.DataFrame([vb.__dict__ for vb in value_bets])[csv_columns]
     else:
-        vb_df = pd.DataFrame(
-            columns=[
-                "match_id", "outcome", "ai_probability", "bookmaker_odds",
-                "expected_value", "kelly_stake_fraction", "recommended_stake",
-            ]
-        )
+        vb_df = pd.DataFrame(columns=csv_columns)
     vb_df.to_csv("value_bets_output.csv", index=False)
     logger.info("Résultats exportés dans value_bets_output.csv")
 
@@ -1408,6 +1587,7 @@ def main(
         n_train_matches=n_matches,
         n_upcoming_matches=len(upcoming_raw),
         bankroll=bankroll,
+        using_real_fixtures=using_real_fixtures,
     )
     with open("report.html", "w", encoding="utf-8") as f:
         f.write(html_report)
